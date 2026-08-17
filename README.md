@@ -2,7 +2,7 @@
 Neural Net to Manual Neuronet
 
 ## Overview
-This repository now includes a minimal SWI-Prolog NN→MNN research MVP in `/home/runner/work/nn2mnn/nn2mnn/mnn_replace.pl`.
+This repository now includes a minimal SWI-Prolog NN→MNN research MVP in `mnn_replace.pl`.
 
 Implemented core capabilities include:
 - explicit inspectable MNN representation (`mnn([neuron(...)])`)
@@ -18,15 +18,15 @@ Implemented core capabilities include:
 
 ## Run tests
 ```bash
-swipl -q -g run_tests -t halt test/test_mnn_replace.pl
+swipl -q -s test/test_mnn_replace.pl -g run_tests -t halt
 ```
 
 ## CLI examples
 ```bash
-swipl mnn_replace.pl --model model1
-swipl mnn_replace.pl --model model1 --component layer3
-swipl mnn_replace.pl --model model1 --progressive
-swipl mnn_replace.pl --model model1 --benchmark
+swipl mnn_cli.pl --model model1
+swipl mnn_cli.pl --model model1 --component gate
+swipl mnn_cli.pl --model model1 --progressive
+swipl mnn_cli.pl --model model1 --benchmark
 ```
 
-`--component` currently runs the default demonstration gate replacement in this MVP.
+`--component` selects a named component (for the built-in demo models, `gate`).

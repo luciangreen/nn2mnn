@@ -32,6 +32,7 @@
 :- use_module(library(filesex)).
 :- use_module(library(readutil)).
 :- use_module(library(statistics)).
+:- use_module(library(http/json)).
 
 :- dynamic replacement_mode/1.
 
@@ -281,9 +282,15 @@ verify_replacement(_, _, unknown).
 
 refine_mnn(mnn([neuron(Id, Inputs, lookup(Pairs, Default))]), CounterExamples,
            mnn([neuron(Id, Inputs, lookup(NewPairs, Default))])) :-
-    append(CounterExamples, Pairs, Combined),
-    sort(Combined, NewPairs).
+    foldl(update_lookup_pair, CounterExamples, Pairs, Updated),
+    sort(Updated, NewPairs).
 refine_mnn(MNN, _CounterExamples, MNN).
+
+update_lookup_pair(Input-Output, Pairs0, [Input-Output|Pairs]) :-
+    exclude(has_input(Input), Pairs0, Pairs).
+
+has_input(Input, Existing-_) :-
+    Existing == Input.
 
 optimise_mnn(mnn([neuron(Id, Inputs, lookup(Pairs, Default))]),
              mnn([neuron(Id, Inputs, lookup(Sorted, Default))])) :-
@@ -311,7 +318,8 @@ find_mnn_replacements(NN, Candidates) :-
           interpretability_score(MNN, Interpretability)
         ),
         Unsorted),
-    sort(3, @>=, Unsorted, Candidates).
+    sort(Unsorted, Unique),
+    sort(3, @>=, Unique, Candidates).
 
 progressive_replace(NN, BestModel) :-
     find_mnn_replacements(NN, Repls),
@@ -341,8 +349,8 @@ speedup(NNTime, MNNTime, Speedup) :-
 size_reduction(NNSize, MNNSize, Reduction) :-
     ( NNSize =:= 0 -> Reduction = 0.0 ; Reduction is (NNSize - MNNSize) / NNSize ).
 
-interpretability_score(mnn([neuron(_, _, lookup(_, _))]), 0.8).
-interpretability_score(mnn([neuron(_, _, boolean(_))]), 0.9).
+interpretability_score(mnn([neuron(_, _, lookup(_, _))]), 0.8) :- !.
+interpretability_score(mnn([neuron(_, _, boolean(_))]), 0.9) :- !.
 interpretability_score(_, 0.5).
 
 % ------------------------------------------------------------------
@@ -364,10 +372,12 @@ mnn_replace(NN, Options, Hybrid) :-
       replace_component(NN, Component, MNN, Hybrid)
     ).
 
-mnn_benchmark(NN, MNN, benchmark(or_problem, OriginalAccuracy, ReplacementAccuracy, Agreement,
+mnn_benchmark(NN, MNN, benchmark(ModelName, OriginalAccuracy, ReplacementAccuracy, Agreement,
                                  OriginalRuntime, ReplacementRuntime, OriginalSize, ReplacementSize,
                                  ReplacementRatio)) :-
-    TestSet = [[0,0]-0,[0,1]-1,[1,0]-1,[1,1]-1],
+    default_inputs(2, Inputs),
+    observe_nn(NN, Inputs, TestSet),
+    term_to_atom(NN, ModelName),
     nn_accuracy(NN, TestSet, OriginalAccuracy),
     compare_nn_mnn(NN, MNN, TestSet,
                    report(ReplacementAccuracy, Agreement, _Errors,
@@ -380,7 +390,8 @@ mnn_research(NN, report(ResultType, Verification, Benchmark, Replacements)) :-
     find_mnn_replacements(NN, Replacements),
     ( Replacements = [replacement(Component, MNN, _, _, _, _)|_]
     -> replace_component(NN, Component, MNN, Hybrid),
-       TestSet = [[0,0]-0,[0,1]-1,[1,0]-1,[1,1]-1],
+       default_inputs(2, Inputs),
+       observe_nn(NN, Inputs, TestSet),
        verify_replacement(comparison(NN, MNN, TestSet), Hybrid, Verification),
        mnn_benchmark(NN, MNN, Benchmark),
        classify_result(Hybrid, ResultType),
@@ -390,8 +401,13 @@ mnn_research(NN, report(ResultType, Verification, Benchmark, Replacements)) :-
       Benchmark = none
     ).
 
-classify_result(hybrid(_, Replacements), 'FULL REPLACEMENT') :-
+classify_result(hybrid(_NN, Replacements), 'FULL REPLACEMENT') :-
     memberchk(full-_, Replacements), !.
+classify_result(hybrid(NN, Replacements), 'FULL REPLACEMENT') :-
+    findall(Component, nn_component(NN, Component), Components0),
+    sort(Components0, Components),
+    Components \= [],
+    forall(member(Component, Components), memberchk(Component-_, Replacements)), !.
 classify_result(hybrid(_, [_|_]), 'PARTIAL REPLACEMENT') :- !.
 classify_result(_, 'NO REPLACEMENT').
 
@@ -412,13 +428,47 @@ write_experiment_files(NN, Component, MNN, Benchmark, Verification) :-
     setup_call_cleanup(open(Obs, write, S2), writeq(S2, observations(Pairs)), close(S2)),
     setup_call_cleanup(open(MnnF, write, S3), writeq(S3, MNN), close(S3)),
     setup_call_cleanup(open(Cex, write, S4), writeq(S4, counterexamples([])), close(S4)),
-    setup_call_cleanup(open(BJ, write, S5), format(S5, '{"benchmark":"~q"}\n', [Benchmark]), close(S5)),
-    setup_call_cleanup(open(BC, write, S6), format(S6, 'benchmark\n~q\n', [Benchmark]), close(S6)),
+    setup_call_cleanup(open(BJ, write, S5), write_benchmark_json(S5, Benchmark), close(S5)),
+    setup_call_cleanup(open(BC, write, S6), write_benchmark_csv(S6, Benchmark), close(S6)),
     setup_call_cleanup(open(RM, write, S7),
-        ( verification_kind(Verification, Kind),
-          format(S7, '~w\nEvidence type: ~w\nEvidence term: ~q\n', [Verification, Kind, Verification])
-        ),
+        write_benchmark_report(S7, Benchmark, Verification),
         close(S7)).
+
+write_benchmark_json(Stream,
+                     benchmark(Model, OriginalAccuracy, ReplacementAccuracy, Agreement,
+                               OriginalRuntime, ReplacementRuntime, OriginalSize, ReplacementSize,
+                               ReplacementRatio)) :-
+    json_write_dict(Stream,
+        _{model: Model,
+          original_accuracy: OriginalAccuracy,
+          replacement_accuracy: ReplacementAccuracy,
+          agreement: Agreement,
+          original_runtime_ms: OriginalRuntime,
+          replacement_runtime_ms: ReplacementRuntime,
+          original_term_size: OriginalSize,
+          replacement_term_size: ReplacementSize,
+          replacement_ratio: ReplacementRatio},
+        [width(0)]),
+    nl(Stream).
+
+write_benchmark_csv(Stream,
+                    benchmark(Model, OriginalAccuracy, ReplacementAccuracy, Agreement,
+                              OriginalRuntime, ReplacementRuntime, OriginalSize, ReplacementSize,
+                              ReplacementRatio)) :-
+    format(Stream, 'model,original_accuracy,replacement_accuracy,agreement,original_runtime_ms,replacement_runtime_ms,original_term_size,replacement_term_size,replacement_ratio~n', []),
+    format(Stream, '~w,~16g,~16g,~16g,~d,~d,~d,~d,~16g~n',
+        [Model, OriginalAccuracy, ReplacementAccuracy, Agreement,
+         OriginalRuntime, ReplacementRuntime, OriginalSize, ReplacementSize, ReplacementRatio]).
+
+write_benchmark_report(Stream, Benchmark, Verification) :-
+    Benchmark = benchmark(Model, OriginalAccuracy, ReplacementAccuracy, Agreement,
+                          OriginalRuntime, ReplacementRuntime, OriginalSize, ReplacementSize,
+                          ReplacementRatio),
+    verification_kind(Verification, Kind),
+    format(Stream,
+        '# MNN replacement experiment~n~n- Model: `~w`~n- Verification: `~w` (~w evidence)~n- Original accuracy: ~16g~n- Replacement accuracy: ~16g~n- Agreement: ~16g~n- Runtime (ms): original ~d, replacement ~d~n- Term size: original ~d, replacement ~d~n- Replacement ratio: ~16g~n',
+        [Model, Verification, Kind, OriginalAccuracy, ReplacementAccuracy, Agreement,
+         OriginalRuntime, ReplacementRuntime, OriginalSize, ReplacementSize, ReplacementRatio]).
 
 default_inputs(2, [[0,0],[0,1],[1,0],[1,1]]).
 default_inputs(N, Inputs) :-
@@ -434,7 +484,7 @@ bits_of_length(N, [B|Bs]) :-
 
 make_testset(Inputs, Inputs).
 
-verification_kind(verified, formal).
+verification_kind(verified, finite_test_set).
 verification_kind(verified_bounded(_), bounded).
 verification_kind(empirically_equivalent(_), empirical).
 verification_kind(failed(_), failed).
